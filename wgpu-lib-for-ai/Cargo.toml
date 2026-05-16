@@ -1,0 +1,16 @@
+[package]
+name = "wgpu-lib-for-ai"
+version = "0.1.0"
+edition = "2024"
+description="headress GPGPU pipeline for AI"
+license="MIT"
+repository="https://github.com/MEKOU-Utils/wgpu_lib_for_ai"
+readme="README.md"
+keywords = ["wgpu", "gpgpu", "compute", "ai"]
+categories = ["science", "graphics"]
+
+[dependencies]
+anyhow   = "1.0"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+wgpu     = "29.0.3"

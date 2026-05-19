@@ -8,3 +8,10 @@ fn main(@builtin(global_invocation_id) global: vec3<u32>) {
     // 入力を 2 倍にするサンプル
     buf[index] = buf[index] * 2.0;
 }
+
+@compute @workgroup_size(64)
+fn sub_main(@builtin(global_invocation_id) global: vec3<u32>) {
+    let index = global.x;
+    if index >= arrayLength(&buf) { return; }
+    buf[index] = buf[index] * 2.0;
+}

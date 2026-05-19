@@ -1,146 +1,182 @@
-///Wgpu constructer
-/// init -> upload -> run_compute -> get_data
+use std::collections::HashMap;
+
+pub enum BufferType {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub struct WgpuBuffer {
+    pub buffer: wgpu::Buffer,
+    pub size: usize,
+} 
 
 pub struct WgpuState {
     pub device:           wgpu::Device,
     pub queue:            wgpu::Queue,
+    // 互換性維持のためのデフォルトパイプライン（"main" 用）
     pub compute_pipeline: wgpu::ComputePipeline,
-    wgpu_bindgroup:       wgpu::BindGroup,
-    pub storage_buffer:   wgpu::Buffer,
-    buf_size:             usize,
+    // エントリーポイント名ごとに事前ビルドしたパイプラインのキャッシュ
+    pub pipelines:        HashMap<String, wgpu::ComputePipeline>,
+    pub wgpu_bindgroup:   wgpu::BindGroup,
+    pub buffers:          Vec<WgpuBuffer>,
 }
 
 impl WgpuState {
-    pub fn update_shader(&mut self, new_shader_src: &str) {
-        // Device を再利用してパイプラインと BindGroup だけ作り直す
-        let (new_pipeline, new_bindgroup, _) = 
-            Self::build(&self.device, new_shader_src, self.buf_size);
-        
-        self.compute_pipeline = new_pipeline;
-        self.wgpu_bindgroup = new_bindgroup;
-        // storage_buffer はそのまま使い回すので、データは維持される
-    }
-
-    ///new_from_shader(shader_src: &str, buf_size: usize) -> `anyhow::Result<Self>`
-    /// shader_src: shader_name.wgsl source
-    /// buf_size: buffersize
-    /// # Example
-    /// ```
-    ///     let mut wgpu_state = pollster::block_on(WgpuState::new_from_shader(
-    ///     include_str!("shader.wgsl"),
-    ///     1024,
-    ///     )).unwrap();
-    /// ```
-    // ---------------------------------------------------------------
-    // constructer
-    // ---------------------------------------------------------------
-    pub async fn new_from_shader(shader_src: &str, buf_size: usize) -> anyhow::Result<Self> {
-        // 1. インスタンス生成
+    
+    pub async fn new_from_shader(
+        shader_src: &str,
+        buffer_config: &[(usize, BufferType)],
+        entry_point: &[&str],
+    ) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
 
-        // 2. アダプター（物理GPU）の取得
-        //    request_adapter は Option<Adapter> を返す
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference:       wgpu::PowerPreference::HighPerformance,
                 compatible_surface:     None,
                 force_fallback_adapter: false,
             })
-            .await?;
+            .await
+            .ok_or_else(|| anyhow::anyhow!("GPU adapter が見つかりません"))?;
 
-        // 3. デバイスとキューの取得
+        let adapter_limits = adapter.limits();
+            
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label:                 Some("Device"),
-                    required_features:     wgpu::Features::empty(),
-                    required_limits:       wgpu::Limits::default(),
-                    memory_hints:          wgpu::MemoryHints::default(),
-                    trace:                 wgpu::Trace::Off,
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    label:             Some("Device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits:   adapter_limits,
+                    memory_hints:      wgpu::MemoryHints::default(),
                 },
+                None,
             )
             .await?;
 
-        // 4. パイプライン・BindGroup・バッファを構築
-        let (compute_pipeline, wgpu_bindgroup, storage_buffer) =
-            Self::build(&device, shader_src, buf_size);
+        // 1. 各バッファのバインドレイアウトを動的に設定
+        let mut layout_entries = Vec::new();
+        for (i, (_, b_type)) in buffer_config.iter().enumerate() {
+            layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { 
+                    ty: wgpu::BufferBindingType::Storage { 
+                        read_only: match b_type {
+                            BufferType::ReadOnly => true,
+                            BufferType::ReadWrite => false,
+                        },
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
 
-        Ok(Self {
-            device,
-            queue,
-            compute_pipeline,
-            wgpu_bindgroup,
-            storage_buffer,
-            buf_size,
-        })
-    }
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dynamic_bgl"),
+            entries: &layout_entries,
+        });
 
-    // ---------------------------------------------------------------
-    // build helper
-    // ---------------------------------------------------------------
-    fn build(
-        device:   &wgpu::Device,
-        src:      &str,
-        buf_size: usize,
-    ) -> (wgpu::ComputePipeline, wgpu::BindGroup, wgpu::Buffer) {
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label:               Some("pipeline"),
-            layout:              None,
+
+        // デフォルトの "main" パイプライン
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label:               Some("pipeline_main"),
+            layout:              Some(&pipeline_layout),
             module:              &shader,
             entry_point:         Some("main"),
             compilation_options: Default::default(),
             cache:               None,
         });
-        let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("storage"),
-            size:               (buf_size * std::mem::size_of::<f32>()) as u64,
-            usage:              wgpu::BufferUsages::STORAGE
-                              | wgpu::BufferUsages::COPY_SRC
-                              | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+
+        let mut pipelines = HashMap::new();
+        
+        // 互換性のためにデフォルトの "main" もキャッシュに入れておく
+        pipelines.insert("main".to_string(), compute_pipeline.clone());
+
+        // ★ 引数で指定されたエントリーポイント群をループで回してビルドする
+        for &entry in entry_point {
+            // "main" は上で既に入れているので重複ビルドをスキップ
+            if entry == "main" { continue; }
+
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label:               Some(&format!("pipeline_{}", entry)),
+                layout:              Some(&pipeline_layout),
+                module:              &shader,
+                entry_point:         Some(entry),
+                compilation_options: Default::default(),
+                cache:               None,
+            });
+            pipelines.insert(entry.to_string(), pipeline);
+        }
+
+        // 2. 実際のバッファ配列の生成
+        let mut buffers = Vec::new();
+        for (i, (size, b_type)) in buffer_config.iter().enumerate() {
+            let usage = match b_type {
+                BufferType::ReadOnly => wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                BufferType::ReadWrite => {
+                    wgpu::BufferUsages::STORAGE 
+                    | wgpu::BufferUsages::COPY_SRC 
+                    | wgpu::BufferUsages::COPY_DST
+                }
+            };
+
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label:              Some(&format!("buffer_{}", i)),
+                size:               (size * std::mem::size_of::<f32>()) as u64,
+                usage,
+                mapped_at_creation: false,
+            });
+
+            buffers.push(WgpuBuffer { buffer, size: *size });
+        }
+
+        // 3. バッファをBindGroupに結びつける
+        let mut bg_entries = Vec::new();
+        for (i, wgpu_buf) in buffers.iter().enumerate() {
+            bg_entries.push(wgpu::BindGroupEntry {
+                binding:  i as u32,
+                resource: wgpu_buf.buffer.as_entire_binding(),
+            });
+        }
+
+        let wgpu_bindgroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("dynamic_bg"),
+            layout:  &bind_group_layout,
+            entries: &bg_entries,
         });
-        let bgl        = pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("bg"),
-            layout:  &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding:  0,
-                resource: storage_buffer.as_entire_binding(),
-            }],
-        });
-        (pipeline, bind_group, storage_buffer)
+
+        Ok(Self {
+            device,
+            queue,
+            compute_pipeline,
+            pipelines,
+            wgpu_bindgroup,
+            buffers,
+        })
     }
 
-    ///upload(&self, data: &[f32])
-    /// Example
-    /// ```
-    ///     let input: Vec<f32> = (0..1024).map(|i| i as f32).collect();
-    ///     wgpu_state.upload(&input);
-    /// ```
-    // ---------------------------------------------------------------
-    // Write data to GPU Buffer
-    // ---------------------------------------------------------------
-    pub fn upload(&self, data: &[f32]) {
+    /// 指定したインデックスのバッファへデータをアップロード
+    pub fn upload(&self, idx: usize, data: &[f32]) {
         self.queue.write_buffer(
-            &self.storage_buffer,
+            &self.buffers[idx].buffer,
             0,
             bytemuck::cast_slice(data),
         );
     }
 
-    ///run_compute(&self, workgroup: u32)
-    /// workgroups: workgroup value
-    /// ```
-    ///     wgpu_state.run_compute(16);
-    /// ```
-    // ---------------------------------------------------------------
-    // Execute compute shader
-    // ---------------------------------------------------------------
+    /// コンピュートシェーダーの実行（デフォルト用）
     pub fn run_compute(&self, workgroups: u32) {
         let mut enc = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("compute") },
@@ -156,16 +192,29 @@ impl WgpuState {
         self.queue.submit(Some(enc.finish()));
     }
 
-    ///get_data(&self) -> `Vec<f32>`
-    /// Example
-    /// ```
-    ///     let data = pollster::block_on(wgpu_state.get_data());
-    /// ```
-    // ---------------------------------------------------------------
-    // Read from GPU buffer
-    // ---------------------------------------------------------------
-    pub async fn get_data(&self) -> Vec<f32> {
-        let size = (self.buf_size * std::mem::size_of::<f32>()) as u64;
+    /// 事前ビルドされた特定のエントリーポイントを指定して高速実行
+    pub fn run_compute_with_entry(&self, entry_point: &str, x: u32, y: u32, z: u32) {
+        let pipeline = self.pipelines.get(entry_point)
+            .expect(&format!("[WgpuState] 未登録のエントリーポイントです: {}", entry_point));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(pipeline);
+            compute_pass.set_bind_group(0, &self.wgpu_bindgroup, &[]);
+            compute_pass.dispatch_workgroups(x, y, z);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
+    /// 指定したインデックスのバッファからデータを回収
+    pub async fn get_data(&self, idx: usize) -> Vec<f32> {
+        let target_buf = &self.buffers[idx];
+        let size = (target_buf.size * std::mem::size_of::<f32>()) as u64;
 
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("staging"),
@@ -177,13 +226,13 @@ impl WgpuState {
         let mut enc = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("read") },
         );
-        enc.copy_buffer_to_buffer(&self.storage_buffer, 0, &staging, 0, size);
+        enc.copy_buffer_to_buffer(&target_buf.buffer, 0, &staging, 0, size);
         self.queue.submit(Some(enc.finish()));
 
-        let slice        = staging.slice(..);
-        let (tx, rx)     = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        self.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();
 
         let data   = slice.get_mapped_range();

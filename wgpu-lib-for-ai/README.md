@@ -12,32 +12,41 @@ this is a wrapper what hide complicated wgpu initialization, and GPGPU Pipeline.
 ## dependencies
 ```
 [dependencies]
-wgpu_lib_for_ai = "0.1.0"
+wgpu_lib_for_ai = "0.1.2"
 pollster = "0.4"
+wgpu = "24" //bevyとの整合性を保ちたい
 ```
 
 ## import
 ```
-use wgpu_lib_for_ai::{WgpuState, pollster, bytemuck};
+use wgpu_lib_for_ai::pollster; // ライブラリ経由で呼び出せる
+use wgpu_lib_for_ai::bytemuck;
+use wgpu_lib_for_ai::{WgpuState, wgpu::wgpu_init::BufferType};
 ```
 
 //main
 ```
-    // 1. initalize (using pollster to block on async)
+    //define binding format
+    let config = vec![
+        (100, BufferType::ReadWrite),
+        (100, BufferType::ReadWrite),
+    ];
+    //initalize
     let mut wgpu_state = pollster::block_on(WgpuState::new_from_shader(
         include_str!("shader.wgsl"),
-        1024,
+        &config,
     )).unwrap();
 
-    // 2. upload to gpu
-    let input: Vec<f32> = (0..1024).map(|i| i as f32).collect();
-    wgpu_state.upload(&input);
+    // upload to GPU
+    let input: Vec<f32> = (0..100).map(|i| i as f32).collect();
+    wgpu_state.upload(0, &input);
 
-    // 3. execute compute shader
-    wgpu_state.run_compute(16); // if workgroup_size(64) = 1024 elements
+    // run compute shader
+    wgpu_state.run_compute(16); // 1024要素 / workgroup_size(64) = 16
 
-    // 4. 結果を取得（async なので block_on）
-    let data = pollster::block_on(wgpu_state.get_data());
+    // get result
+    let data = pollster::block_on(wgpu_state.get_data(0));
+    println!("CPU output {:?}", &input[..10]);
     println!("GPU output (first 10): {:?}", &data[..10]);
 ```
 
